@@ -5,15 +5,29 @@ use std::cmp;
 
 use tcod::console::*;
 use tcod::colors::{ self, Color };
+use tcod::input::{self, Event, Mouse, Key};
 use tcod::map::{Map as FovMap, FovAlgorithm};
 
 use rand::Rng;
 
 // actual size of the window
-const SCREEN_WIDTH: i32 = 80;
-const SCREEN_HEIGHT: i32 = 50;
+const SCREEN_WIDTH: i32 = 100;
+const SCREEN_HEIGHT: i32 = 62;
 
 const LIMIT_FPS: i32 = 20; // 20 frames-per-second maximum
+
+// map size
+const MAP_WIDTH: i32 = 80;
+const MAP_HEIGHT: i32 = 55;
+
+// Parameters for GUI
+const BAR_WIDTH: i32 = 20;
+const PANEL_HEIGHT: i32 = 7;
+const PANEL_Y: i32 = SCREEN_HEIGHT - PANEL_HEIGHT;
+
+const MSG_X: i32 = BAR_WIDTH + 2;
+const MSG_WIDTH: i32 = SCREEN_WIDTH - BAR_WIDTH - 2;
+const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
 
 // player will always be first object
 const PLAYER: usize = 0;
@@ -22,10 +36,6 @@ const PLAYER: usize = 0;
 const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic;
 const FOV_LIGHT_WALLS: bool = true;
 const TORCH_RADIUS: i32 = 10;
-
-// map size
-const MAP_WIDTH: i32 = 80;
-const MAP_HEIGHT: i32 = 45;
 
 // map tile colors
 const COLOR_DARK_WALL: Color = Color { r: 0, g: 0, b: 100 };
@@ -40,6 +50,7 @@ const MAX_ROOMS: i32 = 50;
 const MAX_ROOM_MONSTERS: i32 = 3;
 
 type Map = Vec<Vec<Tile>>;
+type Messages = Vec<(String, Color)>;
 
 #[derive(Clone, Copy, Debug)]
 struct Tile {
@@ -130,7 +141,7 @@ impl Object {
         ((dx.pow(2) + dy.pow(2)) as f32).sqrt()
     }
 
-    pub fn take_damage(&mut self, damage: i32) {
+    pub fn take_damage(&mut self, damage: i32, messages: &mut Messages) {
         // apply damage if possible
         if let Some(fighter) = self.fighter.as_mut() {
             if damage > 0 {
@@ -141,20 +152,24 @@ impl Object {
         if let Some(fighter) = self.fighter {
             if fighter.hp <= 0 {
                 self.alive = false;
-                fighter.on_death.callback(self);
+                fighter.on_death.callback(self, messages);
             }
         }
     }
 
-    pub fn attack(&mut self, target: &mut Object) {
+    pub fn attack(&mut self, target: &mut Object, messages: &mut Messages) {
         // a simple formula for attack damage
         let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
         if damage > 0 {
             // make the target take some damage
-            println!("{} attacks {} for {} hit points.", self.name, target.name, damage);
-            target.take_damage(damage);
+            message(messages,
+                    format!("{} attacks {} for {} hit points.", self.name, target.name, damage),
+                    colors::WHITE);
+            target.take_damage(damage, messages);
         } else {
-            println!("{} attacks {} but it has no effect!", self.name, target.name);
+            message(messages,
+                    format!("{} attacks {} but it has no effect!", self.name, target.name),
+                    colors::WHITE);
         }
     }
 }
@@ -176,13 +191,13 @@ enum DeathCallback {
 }
 
 impl DeathCallback {
-    fn callback(self, object: &mut Object) {
+    fn callback(self, object: &mut Object, messages: &mut Messages) {
         use DeathCallback::*;
-        let callback: fn(&mut Object) = match self {
+        let callback: fn(&mut Object, &mut Messages) = match self {
             Player => player_death,
             Monster => monster_death,
         };
-        callback(object);
+        callback(object, messages);
     }
 }
 
@@ -190,19 +205,21 @@ impl DeathCallback {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Ai;
 
-fn player_death(player: &mut Object) {
+fn player_death(player: &mut Object, messages: &mut Messages) {
     // the game ended!
-    println!("You died!");
+    message(messages, "You died!", colors::RED);
 
     // for added effect, transform the player into a corpse!
     player.char = '%';
     player.color = colors::DARK_RED;
 }
 
-fn monster_death(monster: &mut Object) {
+fn monster_death(monster: &mut Object, messages: &mut Messages) {
     // transform it into a nasty corpse! it doesn't block, can't be
     // attacked and doesn't move
-    println!("{} is dead!", monster.name);
+    message(messages,
+            format!("{} is dead!", monster.name),
+            colors::ORANGE);
     monster.char = '%';
     monster.color = colors::DARK_RED;
     monster.blocks = false;
@@ -232,7 +249,7 @@ fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mu
     move_by(id, dx, dy, map, objects);
 }
 
-fn ai_take_turn(monster_id: usize, map: &Map, objects: &mut [Object], fov_map: &FovMap) {
+fn ai_take_turn(monster_id: usize, map: &Map, objects: &mut [Object], fov_map: &FovMap, messages: &mut Messages) {
     // a basic monster takes its turn. If you can see it, it can see you
     let (monster_x, monster_y) = objects[monster_id].pos();
     if fov_map.is_in_fov(monster_x, monster_y) {
@@ -243,7 +260,7 @@ fn ai_take_turn(monster_id: usize, map: &Map, objects: &mut [Object], fov_map: &
         } else if objects[PLAYER].fighter.map_or(false, |f| f.hp > 0) {
             // close enough, attack! (if the player is still alive.)
             let (monster, target) = mut_two(monster_id, PLAYER, objects);
-            monster.attack(target);
+            monster.attack(target, messages);
         }
     }
 }
@@ -369,14 +386,14 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
         if !is_blocked(x, y, map, objects) {
             let mut monster = if rand::random::<f32>() < 0.8 { // 80% chance of getting an orc
                 // create an orc
-                let mut orc = Object::new(x, y, 'o', "orc", colors::DESATURATED_GREEN, true);
+                let mut orc = Object::new(x, y, 'o', "Orc", colors::DESATURATED_GREEN, true);
                 orc.fighter = Some(Fighter{ max_hp: 10, hp: 10, defense: 0, power: 3,
                                             on_death: DeathCallback::Monster });
                 orc.ai = Some(Ai);
                 orc
             } else {
                 // create a troll
-                let mut troll = Object::new(x, y, 'T', "troll", colors::DARKER_GREEN, true);
+                let mut troll = Object::new(x, y, 'T', "Troll", colors::DARKER_GREEN, true);
                 troll.fighter = Some(Fighter{ max_hp: 16, hp: 16, defense: 1, power: 4,
                                              on_death: DeathCallback::Monster });
                 troll.ai = Some(Ai);
@@ -389,8 +406,52 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
     }
 }
 
-fn render_all(root: &mut Root, con: &mut Offscreen, objects: &[Object], map: &mut Map,
-              fov_map: &mut FovMap, fov_recompute: bool) {
+fn render_bar(panel: &mut Offscreen,
+              x: i32,
+              y: i32,
+              total_width: i32,
+              name: &str,
+              value: i32,
+              maximum: i32,
+              bar_color: Color,
+              back_color: Color)
+{
+    // render a bar (HP, experience, etc). First calculate the width of the bar
+    let bar_width = (value as f32 / maximum as f32 * total_width as f32) as i32;
+
+    // render the background first
+    panel.set_default_background(back_color);
+    panel.rect(x, y, total_width, 1, false, BackgroundFlag::Screen);
+
+    // now render the bar on top
+    panel.set_default_background(bar_color);
+    if bar_width > 0 {
+        panel.rect(x, y, bar_width, 1, false, BackgroundFlag::Screen);
+    }
+
+    // finally, some centered text with the values
+    panel.set_default_foreground(colors::WHITE);
+    panel.print_ex(x + total_width / 2, y, BackgroundFlag::None, TextAlignment::Center,
+                   &format!("{}: {}/{}", name, value, maximum));
+}
+
+fn get_names_under_mouse(mouse: Mouse, objects: &[Object], fov_map: &FovMap) -> String {
+    let (x, y) = (mouse.cx as i32, mouse.cy as i32);
+
+    // create a list with the names of all objects at the mouse's coordinates and in FOV
+    let names = objects
+        .iter()
+        .filter(|obj| {obj.pos() == (x, y) && fov_map.is_in_fov(obj.x, obj.y)})
+        .map(|obj| obj.name.clone())
+        .collect::<Vec<_>>();
+
+    names.join(", ") // join the names, separated by commas
+}
+
+fn render_all(root: &mut Root, con: &mut Offscreen, panel: &mut Offscreen, mouse: Mouse,
+              objects: &[Object], map: &mut Map, messages: &Messages,
+              fov_map: &mut FovMap, fov_recompute: bool)
+{
     if fov_recompute {
         // recompute FOV if needed
         let player = &objects[PLAYER];
@@ -422,10 +483,34 @@ fn render_all(root: &mut Root, con: &mut Offscreen, objects: &[Object], map: &mu
         }
     }
 
-    if let Some(fighter) = objects[PLAYER].fighter {
-        root.print_ex(1, SCREEN_HEIGHT - 2, BackgroundFlag::None, TextAlignment::Left,
-                      format!("HP: {}/{} ", fighter.hp, fighter.max_hp));
+    // prepare to render the GUI panel
+    panel.set_default_background(colors::BLACK);
+    panel.clear();
+
+    // print the game messages, one line at a time
+    let mut y = MSG_HEIGHT as i32;
+    for &(ref msg, color) in messages.iter().rev() {
+        let msg_height = panel.get_height_rect(MSG_X, y, MSG_WIDTH, 0, msg);
+        y -= msg_height;
+        if y < 0 {
+            break;
+        }
+        panel.set_default_foreground(color);
+        panel.print_rect(MSG_X, y, MSG_WIDTH, 0, msg);
     }
+
+    // show the player's stats
+    let hp = objects[PLAYER].fighter.map_or(0, |f| f.hp);
+    let max_hp = objects[PLAYER].fighter.map_or(0, |f| f.max_hp);
+    render_bar(panel, 1, 1, BAR_WIDTH, "HP", hp, max_hp, colors::LIGHT_RED, colors::DARKER_RED);
+
+    // display names of objects under the mouse
+    panel.set_default_foreground(colors::LIGHT_GREY);
+    panel.print_ex(1, 0, BackgroundFlag::None, TextAlignment::Left,
+                   get_names_under_mouse(mouse, objects, fov_map));
+
+    // blit the contents of the 'panel' to the root console
+    blit(panel, (0, 0), (SCREEN_WIDTH, PANEL_HEIGHT), root, (0, PANEL_Y), 1.0, 1.0);
 
     let mut to_draw: Vec<_> = objects.iter().filter(|o| fov_map.is_in_fov(o.x, o.y)).collect();
     // sort so that non-blocking objects come first
@@ -440,7 +525,17 @@ fn render_all(root: &mut Root, con: &mut Offscreen, objects: &[Object], map: &mu
     blit(con, (0, 0), (MAP_WIDTH, MAP_HEIGHT), root, (0, 0), 1.0, 1.0);
 }
 
-fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
+fn message<T: Into<String>>(messages: &mut Messages, message: T, color: Color) {
+    // if the buffer is full, remove the first message to make room for the new one
+    if messages.len() == MSG_HEIGHT {
+        messages.remove(0);
+    }
+
+    // add the new line as a tuple, with the text and color
+    messages.push((message.into(), color));
+}
+
+fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object], messages: &mut Messages) {
     // the coordinates the player is moving to/attacking
     let x = objects[PLAYER].x + dx;
     let y = objects[PLAYER].y + dy;
@@ -454,7 +549,7 @@ fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
     match target_id {
         Some(target_id) => {
             let (player, target) = mut_two(PLAYER, target_id, objects);
-            player.attack(target);
+            player.attack(target, messages);
         }
         None => {
             move_by(PLAYER, dx, dy, map, objects);
@@ -462,12 +557,12 @@ fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
     }
 }
 
-fn handle_keys(root: &mut Root, map: &Map, objects: &mut [Object]) -> PlayerAction {
+fn handle_keys(key: Key, root: &mut Root, map: &Map, objects: &mut [Object],
+               messages: &mut Messages) -> PlayerAction {
     use tcod::input::Key;
     use tcod::input::KeyCode::*;
     use PlayerAction::*;
 
-    let key = root.wait_for_keypress(true);
     let player_alive = objects[PLAYER].alive;
     match (key, player_alive) {
         (Key { code: Enter, alt: true, .. }, _) => {
@@ -479,19 +574,19 @@ fn handle_keys(root: &mut Root, map: &Map, objects: &mut [Object]) -> PlayerActi
         (Key { code: Escape, .. }, _) => Exit, // exit game
         // movement keys
         (Key { code: Up, .. }, true) => {
-            player_move_or_attack(0, -1, map, objects);
+            player_move_or_attack(0, -1, map, objects, messages);
             TookTurn
         }
         (Key { code: Down, .. }, true) => {
-            player_move_or_attack(0, 1, map, objects);
+            player_move_or_attack(0, 1, map, objects, messages);
             TookTurn
         }
         (Key { code: Left, .. }, true) => {
-            player_move_or_attack(-1, 0, map, objects);
+            player_move_or_attack(-1, 0, map, objects, messages);
             TookTurn
         }
         (Key { code: Right, .. }, true) => {
-            player_move_or_attack(1, 0, map, objects);
+            player_move_or_attack(1, 0, map, objects, messages);
             TookTurn
         }
 
@@ -515,10 +610,11 @@ fn main() {
         .init();
     tcod::system::set_fps(LIMIT_FPS);
     let mut con = Offscreen::new(MAP_WIDTH, MAP_HEIGHT);
+    let mut panel = Offscreen::new(SCREEN_WIDTH, PANEL_HEIGHT);
 
     // Create object representing player
     // place player inside the first room
-    let mut player = Object::new(0, 0, '@', "player", colors::WHITE, true);
+    let mut player = Object::new(0, 0, '@', "Player", colors::WHITE, true);
     player.alive = true;
     player.fighter = Some(Fighter{ max_hp: 30, hp: 30, defense: 2, power: 5,
                                    on_death: DeathCallback::Player });
@@ -539,13 +635,31 @@ fn main() {
         }
     }
 
+    // create the list of game messages and their colors, starts empty
+    let mut messages = vec![];
+
+    // a warm welcoming message!
+    message(&mut messages, "Welcome stranger! Prepare to perish in the Tombs of the Ancient Kings.",
+            colors::RED);
+
     // Force FOV to recompute first game loop
     let mut previous_player_position = (-1, -1);
 
+    let mut mouse = Default::default();
+    let mut key = Default::default();
+
     while !root.window_closed() {
+        match input::check_for_event(input::MOUSE | input::KEY_PRESS) {
+            Some((_, Event::Mouse(m))) => mouse = m,
+            Some((_, Event::Key(k))) => key = k,
+            _ => key = Default::default(),
+        }
+
         // render the screen
         let fov_recompute = previous_player_position != (objects[PLAYER].x, objects[PLAYER].y);
-        render_all(&mut root, &mut con, &objects, &mut map, &mut fov_map, fov_recompute);
+        render_all(&mut root, &mut con, &mut panel, mouse,
+                   &objects, &mut map, &messages,
+                   &mut fov_map, fov_recompute);
 
         root.flush();
 
@@ -556,7 +670,7 @@ fn main() {
         
         // handle keys and exit game if needed
         previous_player_position = objects[PLAYER].pos();
-        let player_action = handle_keys(&mut root, &map, &mut objects);
+        let player_action = handle_keys(key, &mut root, &map, &mut objects, &mut messages);
         if player_action == PlayerAction::Exit {
             break
         }
@@ -565,7 +679,7 @@ fn main() {
         if objects[PLAYER].alive && player_action != PlayerAction::DidntTakeTurn {
             for id in 0..objects.len() {
                 if objects[id].ai.is_some() {
-                    ai_take_turn(id, &map, &mut objects, &fov_map);
+                    ai_take_turn(id, &map, &mut objects, &fov_map, &mut messages);
                 }
             }
         }
