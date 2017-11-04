@@ -1170,9 +1170,16 @@ fn main_menu(tcod: &mut Tcod) {
                 play_game(&mut objects, &mut game, tcod);
             }
             Some(1) => {
-                let (mut objects, mut game) = load_game().unwrap();
-                initialise_fov(&game.map, tcod);
-                play_game(&mut objects, &mut game, tcod);
+                match load_game() {
+                    Ok((mut objects, mut game)) => {
+                        initialise_fov(&game.map, tcod);
+                        play_game(&mut objects, &mut game, tcod);
+                    }
+                    Err(_e) => {
+                        msgbox("\nNo saved game to load.\n", 24, &mut tcod.root);
+                        continue
+                    }
+                }
             }
             Some(2) => { // quit
                 break
@@ -1180,6 +1187,11 @@ fn main_menu(tcod: &mut Tcod) {
             _ => {}
         }
     }
+}
+
+fn msgbox(text: &str, width: i32, root: &mut Root) {
+    let options: &[&str] = &[];
+    menu(text, options, width, root);
 }
 
 fn save_game(objects: &[Object], game: &Game) -> Result<(), Box<Error>> {
